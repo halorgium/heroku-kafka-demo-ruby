@@ -3,34 +3,34 @@ require 'sinatra'
 require 'json'
 require 'active_support/notifications'
 require 'tempfile'
+require 'pry'
 
+ADDON_ATTACHMENT = ENV.fetch("ADDON_ATTACHMENT", "KAFKA")
 KAFKA_TOPIC = ENV.fetch("KAFKA_TOPIC", "messages")
 GROUP_ID = ENV.fetch("KAFKA_CONSUMER_GROUP", "heroku-kafka-demo")
 
 def with_prefix(name)
-  "#{ENV["KAFKA_PREFIX"]}#{name}"
+  "#{ENV["#{ADDON_ATTACHMENT}_PREFIX"]}#{name}"
 end
 
-def initialize_kafka
-  tmp_ca_file = Tempfile.new('ca_certs')
-  tmp_ca_file.write(ENV.fetch("KAFKA_TRUSTED_CERT"))
-  tmp_ca_file.close
+def connect_to_cluster
   # This demo app connects to kafka on multiple threads.
   # Right now ruby-kafka isn't thread safe, so we establish a new client
   # for the consumer and a different one for the consumer.
-  producer_kafka = Kafka.new(
-    seed_brokers: ENV.fetch("KAFKA_URL"),
-    ssl_ca_cert_file_path: tmp_ca_file.path,
-    ssl_client_cert: ENV.fetch("KAFKA_CLIENT_CERT"),
-    ssl_client_cert_key: ENV.fetch("KAFKA_CLIENT_CERT_KEY"),
+  Kafka.new(
+    seed_brokers: ENV.fetch("#{ADDON_ATTACHMENT}_URL"),
+    ssl_ca_cert_file_path: $tmp_ca_file.path,
+    ssl_client_cert: ENV.fetch("#{ADDON_ATTACHMENT}_CLIENT_CERT"),
+    ssl_client_cert_key: ENV.fetch("#{ADDON_ATTACHMENT}_CLIENT_CERT_KEY"),
   )
-  $producer = producer_kafka.async_producer(delivery_interval: 1)
-  consumer_kafka = Kafka.new(
-    seed_brokers: ENV.fetch("KAFKA_URL"),
-    ssl_ca_cert: ENV.fetch("KAFKA_TRUSTED_CERT"),
-    ssl_client_cert: ENV.fetch("KAFKA_CLIENT_CERT"),
-    ssl_client_cert_key: ENV.fetch("KAFKA_CLIENT_CERT_KEY"),
-  )
+end
+
+def initialize_kafka
+  $tmp_ca_file = Tempfile.new('ca_certs')
+  $tmp_ca_file.write(ENV.fetch("#{ADDON_ATTACHMENT}_TRUSTED_CERT"))
+  $tmp_ca_file.close
+
+  $producer = connect_to_cluster.async_producer(delivery_interval: 1)
 
   # Connect a consumer. Consumers in Kafka have a "group" id, which
   # denotes how consumers balance work. Each group coordinates
@@ -38,19 +38,40 @@ def initialize_kafka
   # For the demo app, there's only one group, but a production app
   # could use separate groups for e.g. processing events and archiving
   # raw events to S3 for longer term storage
-  $consumer = consumer_kafka.consumer(group_id: with_prefix(GROUP_ID))
+  $consumer = connect_to_cluster.consumer(group_id: with_prefix(GROUP_ID))
   $recent_messages = []
-  start_consumer
-  start_metrics
+  #start_consumer
+  #start_metrics
 
   at_exit do
     $producer.shutdown
-    tmp_ca_file.unlink
+    $tmp_ca_file.unlink
   end
 end
 
 get '/' do
   erb :index
+end
+
+get '/cert-check' do
+  content_type :json
+
+  cluster = $producer.instance_variable_get(:@worker).instance_variable_get(:@producer).instance_variable_get(:@cluster)
+  broker_pool = cluster.instance_variable_get(:@broker_pool)
+
+  brokers = cluster.instance_variable_get(:@seed_brokers).map do |node|
+    test_connection(node, broker_pool)
+  end
+
+  {attachment: ADDON_ATTACHMENT, brokers: brokers}.to_json
+end
+
+def test_connection(node, broker_pool)
+  broker = broker_pool.connect(node.hostname, node.port)
+  cluster_info = broker.fetch_metadata(topics: [])
+  {ok?: true, hostname: node.hostname, topics: cluster_info.topics.map(&:topic_name)}
+rescue OpenSSL::SSL::SSLError => e
+  {ok?: false, hostname: node.hostname, exception: e.inspect}
 end
 
 # This endpoint accesses in memory state gathered

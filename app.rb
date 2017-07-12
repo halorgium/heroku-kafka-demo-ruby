@@ -13,24 +13,28 @@ def with_prefix(name)
   "#{ENV["#{ADDON_ATTACHMENT}_PREFIX"]}#{name}"
 end
 
-def connect_to_cluster
-  # This demo app connects to kafka on multiple threads.
-  # Right now ruby-kafka isn't thread safe, so we establish a new client
-  # for the consumer and a different one for the consumer.
+$tmp_ca_files = []
+
+def connect_to_cluster(client_cert_prefix, trusted_cert_prefix)
+  tmp_ca_file = Tempfile.new('ca_certs')
+  tmp_ca_file.write(ENV.fetch("#{trusted_cert_prefix}_TRUSTED_CERT"))
+  tmp_ca_file.close
+
+  $tmp_ca_files << tmp_ca_file
+
   Kafka.new(
-    seed_brokers: ENV.fetch("#{ADDON_ATTACHMENT}_URL"),
-    ssl_ca_cert_file_path: $tmp_ca_file.path,
-    ssl_client_cert: ENV.fetch("#{ADDON_ATTACHMENT}_CLIENT_CERT"),
-    ssl_client_cert_key: ENV.fetch("#{ADDON_ATTACHMENT}_CLIENT_CERT_KEY"),
+    seed_brokers: ENV.fetch("#{client_cert_prefix}_URL"),
+    ssl_ca_cert_file_path: tmp_ca_file.path,
+    ssl_client_cert: ENV.fetch("#{client_cert_prefix}_CLIENT_CERT"),
+    ssl_client_cert_key: ENV.fetch("#{client_cert_prefix}_CLIENT_CERT_KEY"),
   )
 end
 
 def initialize_kafka
-  $tmp_ca_file = Tempfile.new('ca_certs')
-  $tmp_ca_file.write(ENV.fetch("#{ADDON_ATTACHMENT}_TRUSTED_CERT"))
-  $tmp_ca_file.close
-
-  $producer = connect_to_cluster.async_producer(delivery_interval: 1)
+  # This demo app connects to kafka on multiple threads.
+  # Right now ruby-kafka isn't thread safe, so we establish a new client
+  # for the consumer and a different one for the consumer.
+  $producer = connect_to_cluster(ADDON_ATTACHMENT, ADDON_ATTACHMENT).async_producer(delivery_interval: 1)
 
   # Connect a consumer. Consumers in Kafka have a "group" id, which
   # denotes how consumers balance work. Each group coordinates
@@ -38,14 +42,14 @@ def initialize_kafka
   # For the demo app, there's only one group, but a production app
   # could use separate groups for e.g. processing events and archiving
   # raw events to S3 for longer term storage
-  $consumer = connect_to_cluster.consumer(group_id: with_prefix(GROUP_ID))
+  $consumer = connect_to_cluster(ADDON_ATTACHMENT, ADDON_ATTACHMENT).consumer(group_id: with_prefix(GROUP_ID))
   $recent_messages = []
   #start_consumer
   #start_metrics
 
   at_exit do
     $producer.shutdown
-    $tmp_ca_file.unlink
+    $tmp_ca_files.map(&:unlink)
   end
 end
 
@@ -56,14 +60,21 @@ end
 get '/cert-check' do
   content_type :json
 
-  cluster = $producer.instance_variable_get(:@worker).instance_variable_get(:@producer).instance_variable_get(:@cluster)
-  broker_pool = cluster.instance_variable_get(:@broker_pool)
+  {both: "", legacy: "_LEGACY", modern: "_MODERN"}.flat_map do |trusted_cert,trusted_cert_prefix|
+    {legacy: "_LEGACY", modern: "_MODERN"}.map do |client_cert,client_cert_prefix|
+      client = connect_to_cluster("#{ADDON_ATTACHMENT}#{client_cert_prefix}", "#{ADDON_ATTACHMENT}#{trusted_cert_prefix}")
+      cluster = client.instance_variable_get(:@cluster)
+      broker_pool = cluster.instance_variable_get(:@broker_pool)
 
-  brokers = cluster.instance_variable_get(:@seed_brokers).map do |node|
-    test_connection(node, broker_pool)
-  end
+      brokers = cluster.instance_variable_get(:@seed_brokers).map do |node|
+        test_connection(node, broker_pool)
+      end
 
-  {attachment: ADDON_ATTACHMENT, brokers: brokers}.to_json
+      cluster.disconnect
+
+      {trusted_cert: trusted_cert, client_cert: client_cert, brokers: brokers}
+    end
+  end.to_json
 end
 
 def test_connection(node, broker_pool)
